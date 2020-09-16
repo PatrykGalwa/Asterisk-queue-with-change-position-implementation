@@ -3,7 +3,7 @@ A new working implementation for asterisk queue to process with change queue pos
 
 Implementation includes CLI command "queue position caller" and manager action "QueueChangePositionCaller".
 
-To use it, download the newest LTS version of Asterisk (now is 16-16/09/2020). Unzip it in working directory. Enter into asterisk-{version}/apps and paste app_queue.c into it. Build asterisk (make make install) and reload asterisk. 
+To use it, download the newest LTS version of Asterisk (now is 16-16/09/2020). Unzip it in working directory. Enter into asterisk-{version}/apps and paste app_queue.c into it. Build (make make install) and reload asterisk. 
 
 That's it! Your own queue with changing position is now yours!
 
