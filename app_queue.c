@@ -1055,7 +1055,27 @@
 			</parameter>
 		</syntax>
 		<description>
-		    <papa>Change position in queue. It is highly recommended to not changing position when queue is hudge (more than 50 waiting).</para>
+		    <papa>Change position in queue. It is highly recommended to not changing position when queue is hudge.</para>
+		</description>
+    </manager>
+    <manager name="QueueMoveCallerBetweenQueues" language="en_US">
+        <synopsis>
+            Move caller between queues.
+        </synopsis>
+        <syntax>
+			<xi:include xpointer="xpointer(/docs/manager[@name='Login']/syntax/parameter[@name='ActionID'])" />
+			<parameter name="FirstQueue" required="true">
+				<para>The name of the queue to move caller from.</para>
+			</parameter>
+			<parameter name="SecondQueue" required="true">
+				<para>The name of the queue to move caller to.</para>
+			</parameter>
+			<parameter name="Caller" required="true">
+				<para>The caller (channel) to change priority on queue.</para>
+			</parameter>
+		</syntax>
+		<description>
+		    <papa>Move caller from one to another queue.</para>
 		</description>
     </manager>
 
@@ -1461,14 +1481,15 @@ static const struct autopause {
 
 #define MAX_QUEUE_BUCKETS 53
 
-#define    RES_OKAY (0)                /*!< Action completed */
-#define    RES_EXISTS    (-1)            /*!< Entry already exists */
-#define    RES_OUTOFMEMORY    (-2)        /*!< Out of memory */
-#define    RES_NOSUCHQUEUE    (-3)        /*!< No such queue */
+#define RES_OKAY (0)                /*!< Action completed */
+#define RES_EXISTS (-1)             /*!< Entry already exists */
+#define RES_OUTOFMEMORY (-2)        /*!< Out of memory */
+#define RES_NOSUCHQUEUE (-3)        /*!< No such queue */
 #define RES_NOT_DYNAMIC (-4)        /*!< Member is not dynamic */
-#define RES_NOT_CALLER  (-5)        /*!< Caller not found */
+#define RES_NOT_CALLER (-5)         /*!< Caller not found */
 #define RES_POSITION_TOO_BIG (-6)   /*!< Position in queue too big */
 #define RES_POSITION_TOO_SMALL (-7) /*!< Position in queue too small */
+#define RES_QUEUE_FULL (-8)         /*!< Second queue full, move failed */
 
 static char *app = "Queue";
 
@@ -1811,7 +1832,7 @@ static int update_queue(struct call_queue *q, struct member *member, int callcom
 
 static struct member *find_member_by_queuename_and_interface(const char *queuename, const char *interface);
 
-void join_queue_for_change_pos(struct queue_ent *qe, int position);
+void join_queue_for_change_pos(struct call_queue *q, struct queue_ent *qe, int position);
 
 void leave_queue_for_change_position(struct queue_ent *qe);
 
@@ -7465,6 +7486,68 @@ static int change_priority_caller_on_queue(const char *queuename, const char *ca
     return res;
 }
 
+/*! \brief Move caller between queues
+ * \retval RES_NOSUCHQUEUE first or second queue does not exist
+ * \retval RES_OKAY move between queues okay
+ * \retval RES_NOT_CALLER queues exist but no caller
+ * \retval RES_QUEUE_FULL second queue is full
+ * \retval RES_POSITION_TOO_SMALL queue exists, caller exists, but position is too small for move
+ */
+
+static int move_caller_between_queues(const char *firstQueueName, const char *secondQueueName, const char *caller) {
+    struct call_queue *firstQueue;
+    struct call_queue *secondQueue;
+    struct queue_ent *queueEnt, *qe;
+    int res = RES_OKAY;
+
+    if (!(firstQueue = find_load_queue_rt_friendly(firstQueueName))) {
+        res = RES_NOSUCHQUEUE;
+        return res;
+    }
+
+    if (!(secondQueue = find_load_queue_rt_friendly(secondQueueName))) {
+        res = RES_NOSUCHQUEUE;
+        return res;
+    }
+
+    if (secondQueue->maxlen <= secondQueue->count) {
+        res = RES_QUEUE_FULL;
+        return res;
+    }
+
+    ao2_lock(firstQueue);
+    ao2_lock(secondQueue);
+
+    for (qe = firstQueue->head; qe; qe = qe->next) {
+        if (strcmp(ast_channel_name(qe->chan), caller) == 0) {
+            queueEnt = qe;
+            break;
+        }
+    }
+
+    if (queueEnt == NULL) {
+        res = RES_NOT_CALLER;
+        ao2_unlock(firstQueue);
+        ao2_unlock(secondQueue);
+        return res;
+    }
+
+    if (queueEnt->pos < 2) {
+        res = RES_POSITION_TOO_SMALL;
+        ao2_unlock(firstQueue);
+        ao2_unlock(secondQueue);
+        return res;
+    }
+
+    leave_queue_for_change_position(queueEnt);
+    queueEnt->parent = secondQueue;
+    join_queue_for_change_pos(secondQueue, queueEnt, -1);
+    ao2_unlock(firstQueue);
+    ao2_unlock(secondQueue);
+
+    return res;
+}
+
 /*! \brief Change position caller into a queue
  * \retval RES_NOSUCHQUEUE queue does not exist
  * \retval RES_OKAY change position
@@ -7510,7 +7593,7 @@ static int change_position_caller_on_queue(const char *queuename, const char *ca
     }
 
     leave_queue_for_change_position(qe);
-    join_queue_for_change_pos(qe, position);
+    join_queue_for_change_pos(qe->parent, qe, position);
 
     ao2_unlock(q);
     return res;
@@ -7558,8 +7641,7 @@ void leave_queue_for_change_position(struct queue_ent *qe) {
     }
 }
 
-void join_queue_for_change_pos(struct queue_ent *qe, int position) {
-    struct call_queue *q = qe->parent;
+void join_queue_for_change_pos(struct call_queue *q, struct queue_ent *qe, int position) {
     struct queue_ent *cur, *prev = NULL;
     int pos = 0;
     int inserted = 0;
@@ -7590,9 +7672,9 @@ void join_queue_for_change_pos(struct queue_ent *qe, int position) {
     /* No luck, join at the end of the queue */
     if (!inserted) {
         qe->last_pos = now;
-        qe->last_pos_said = position;
-        qe->pos = position;
-        insert_entry(q, prev, qe, &position);
+        qe->last_pos_said = pos;
+        qe->pos = pos;
+        insert_entry(q, prev, qe, &pos);
     }
     ast_copy_string(qe->moh, q->moh, sizeof(qe->moh));
     ast_copy_string(qe->announce, q->announce, sizeof(qe->announce));
@@ -10616,6 +10698,49 @@ static int manager_queue_member_penalty(struct mansession *s, const struct messa
     return 0;
 }
 
+static int manager_move_caller_between_queues(struct mansession *s, const struct message *m) {
+    const char *firstQueueName, *secondQueueName, *caller;
+
+    firstQueueName = astman_get_header(m, "FirstQueue");
+    secondQueueName = astman_get_header(m, "SecondQueue");
+    caller = astman_get_header(m, "Caller");
+
+    if (ast_strlen_zero(firstQueueName)) {
+        astman_send_error(s, m, "'FirstQueue' not specified.");
+        return 0;
+    }
+
+    if (ast_strlen_zero(secondQueueName)) {
+        astman_send_error(s, m, "'SecondQueue' not specified.");
+        return 0;
+    }
+
+    if (ast_strlen_zero(caller)) {
+        astman_send_error(s, m, "'Caller' not specified.");
+        return 0;
+    }
+
+    switch (move_caller_between_queues(firstQueueName, secondQueueName, caller)) {
+        case RES_OKAY:
+            astman_send_ack(s, m, "Caller moved between queues");
+            break;
+        case RES_NOSUCHQUEUE:
+            astman_send_error(s, m, "Unable to move caller between queues: No such queues");
+            break;
+        case RES_NOT_CALLER:
+            astman_send_error(s, m, "Unable to move caller between queues: No such caller");
+            break;
+        case RES_QUEUE_FULL:
+            astman_send_error(s, m, "Unable to move caller between queues: Second queue is full");
+            break;
+        case RES_POSITION_TOO_SMALL:
+            astman_send_error(s, m, "Unable to move caller between queues: Position of caller is too small");
+            break;
+    }
+
+    return 0;
+}
+
 static int manager_change_position_caller_on_queue(struct mansession *s, const struct message *m) {
     const char *queuename, *caller, *position_s;
     int position = 0;
@@ -10891,6 +11016,55 @@ static char *handle_queue_remove_member(struct ast_cli_entry *e, int cmd, struct
     return res;
 }
 
+static char *handle_caller_move_between_queues(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
+    const char *firstQueueName, *secondQueueName, *caller;
+    char *res = CLI_FAILURE;
+
+    switch (cmd) {
+        case CLI_INIT:
+            e->command = "queue move caller";
+            e->usage =
+                    "Usage: queue move caller <channel> from <firstQueue> to <secondQueue>\n"
+                    "       Move caller between queues. Note that caller is placed on last\n"
+                    "       position in queue.";
+            return NULL;
+        case CLI_GENERATE:
+            return NULL;
+    }
+
+    if (a->argc != 8) {
+        return CLI_SHOWUSAGE;
+    } else if (strcmp(a->argv[4], "from")) {
+        return CLI_SHOWUSAGE;
+    } else if (strcmp(a->argv[6], "to")) {
+        return CLI_SHOWUSAGE;
+    }
+
+    caller = a->argv[3];
+    firstQueueName = a->argv[5];
+    secondQueueName = a->argv[7];
+
+    switch (move_caller_between_queues(firstQueueName, secondQueueName, caller)) {
+        case RES_OKAY:
+            res = CLI_SUCCESS;
+            break;
+        case RES_NOSUCHQUEUE:
+            ast_cli(a->fd, "Unable to move caller %s from queue '%s' to queue '%s': No such queues\n", caller, firstQueueName, secondQueueName);
+            break;
+        case RES_NOT_CALLER:
+            ast_cli(a->fd, "Unable to move caller %s from queue '%s' to queue '%s': No such caller\n", caller, firstQueueName, secondQueueName);
+            break;
+        case RES_POSITION_TOO_SMALL:
+            ast_cli(a->fd, "Unable to move caller %s from queue '%s' to queue '%s': Caller position is too small\n", caller, firstQueueName, secondQueueName);
+            break;
+        case RES_QUEUE_FULL:
+            ast_cli(a->fd, "Unable to move caller %s from queue '%s' to queue '%s': Second queue full\n", caller, firstQueueName, secondQueueName);
+            break;
+    }
+
+    return res;
+}
+
 static char *handle_queue_change_position_caller(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
     const char *queuename, *caller;
     int position;
@@ -10901,13 +11075,13 @@ static char *handle_queue_change_position_caller(struct ast_cli_entry *e, int cm
             e->command = "queue position caller";
             e->usage =
                     "Usage: queue position caller <channel> on <queue> to <position>\n"
-                    "       Change position of a channel on a queue.\n"
+                    "       Change position of a caller on a queue.\n"
                     "       \n"
-                    "       It is highly not recommended to use this when queue is bigger\n"
-                    "       than 10.\n"
+                    "       It is highly not recommended to use this when queue is hudge.\n"
+                    "       \n"
                     "       You cannot change position to higher than queue size or if\n"
-                    "       queue is not full then last position of active caller\n"
-                    "       first position is always reserved.";
+                    "       queue is not full then last position of active caller.\n"
+                    "       First position is always reserved.";
             return NULL;
         case CLI_GENERATE:
             return NULL;
@@ -10937,6 +11111,10 @@ static char *handle_queue_change_position_caller(struct ast_cli_entry *e, int cm
         case RES_NOT_CALLER:
             ast_cli(a->fd, "Unable to change position caller '%s' on queue '%s': Not there\n", caller, queuename);
             break;
+        case RES_POSITION_TOO_SMALL:
+            ast_cli(a->fd, "Unable to change position caller '%s' on queue '%s': Position too small\n", caller,
+                    queuename);
+            break;
         case RES_POSITION_TOO_BIG:
             ast_cli(a->fd, "Unable to change position caller '%s' on queue '%s': Position too big\n", caller,
                     queuename);
@@ -10945,7 +11123,6 @@ static char *handle_queue_change_position_caller(struct ast_cli_entry *e, int cm
 
     return res;
 }
-
 
 static char *handle_queue_change_priority_caller(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
     const char *queuename, *caller;
@@ -11440,6 +11617,7 @@ static struct ast_cli_entry cli_queue[] = {
         AST_CLI_DEFINE(handle_queue_reset, "Reset statistics for a queue"),
         AST_CLI_DEFINE(handle_queue_change_priority_caller, "Change priority caller on queue"),
         AST_CLI_DEFINE(handle_queue_change_position_caller, "Change position caller on queue"),
+        AST_CLI_DEFINE(handle_caller_move_between_queues, "Move caller between queues"),
 };
 
 static struct stasis_message_router *agent_router;
@@ -11483,6 +11661,7 @@ static int unload_module(void) {
     ast_manager_unregister("QueueMemberRingInUse");
     ast_manager_unregister("QueueChangePriorityCaller");
     ast_manager_unregister("QueueChangePositionCaller");
+    ast_manager_unregister("QueueMoveCallerBetweenQueues");
     ast_unregister_application(app_aqm);
     ast_unregister_application(app_rqm);
     ast_unregister_application(app_pqm);
@@ -11600,6 +11779,7 @@ static int load_module(void) {
     err |= ast_manager_register_xml("QueueReset", 0, manager_queue_reset);
     err |= ast_manager_register_xml("QueueChangePriorityCaller", 0, manager_change_priority_caller_on_queue);
     err |= ast_manager_register_xml("QueueChangePositionCaller", 0, manager_change_position_caller_on_queue);
+    err |= ast_manager_register_xml("QueueMoveCallerBetweenQueues", 0, manager_move_caller_between_queues);
     err |= ast_custom_function_register(&queuevar_function);
     err |= ast_custom_function_register(&queueexists_function);
     err |= ast_custom_function_register(&queuemembercount_function);
